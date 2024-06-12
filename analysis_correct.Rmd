@@ -1,0 +1,1765 @@
+---
+title: "Analysis"
+author: "Bas van Remmerden"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+
+# Set up
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+options(scipen=999)
+```
+
+# Setting seed
+```{r}
+set.seed(123)
+```
+
+## Loading libraries
+Loading the required libraries
+```{r warning = F, message = F}
+#### Installing/loading packages
+required_packages <- c(
+  "tidyverse",
+  "lubridate",
+  "tidymodels",
+  "beepr",
+  "stargazer",
+  "extrafont",
+  "gridExtra",
+  "ranger",
+  "vip",
+  "pdp",
+  "iml",
+  "DALEX"
+)
+
+# install.packages(required packages)
+for (pkg in required_packages) {
+  require(pkg, character.only = TRUE)
+}
+
+# Cleaning the environment before analysis
+rm(pkg, required_packages)
+
+# Loading more fonts
+#font_import()
+#loadfonts(device = "win")
+```
+## Setting functions
+```{r}
+# Function to plot partial dependence plots
+plot_single_partial_dependence_ggplot <- function(pdp_data) {
+  pdp_df <- pdp_data$agr_profiles
+  
+  p <- ggplot(pdp_df, aes(x = `_x_`, y = `_yhat_`)) +
+    geom_line() +
+    geom_point() +
+    labs(
+      title = "",
+      x = "Feature Value",
+      y = "Predicted Value"
+    ) +
+    theme_classic() +
+    theme(
+    text = element_text(family = "Times New Roman", size = 16)) +
+    facet_wrap(~ `_vname_`, scales = "free_x", ncol = 3)
+  
+  return(p)
+}
+```
+
+# Loading the data
+```{r}
+load("data/analysis.RData")
+load("data/analysis_smote.RData")
+```
+
+# Data preparation regular
+```{r}
+# Filter
+df.analysis_filt <- df.analysis %>%
+  filter(irregularity != 2) %>% # Filtering out all non-restatement observations
+  mutate(irregularity = as.factor(irregularity))
+
+
+# Splitting the data
+split_testing <- initial_split(
+  data = df.analysis_filt, prop = .8,
+  strata = irregularity # Stratisfy on irregularity to 
+                        # make sure there are enough fraud cases
+)
+
+df.analysis_test <- testing(split_testing)
+df.analysis_train_assess <- training(split_testing)
+
+
+# Splitting the data
+split_assessment <- initial_split(
+  data = df.analysis_train_assess, prop = .6,
+  strata = irregularity # Stratisfy on irregularity to 
+                        # make sure there are enough fraud cases
+)
+
+
+
+df.analysis_train <- training(split_assessment)
+df.analysis_assess <- testing(split_assessment)
+
+
+
+
+
+# Cross validation
+cv_folds <- df.analysis_train %>% vfold_cv(v = 5, strata = irregularity) # Stratisfy on irregularity to 
+                                                                         # make sure there are enough
+                                                                         # fraud cases in each fold
+
+
+```
+
+# Data preparation SMOTE
+```{r}
+df.analysis_smote_orig <- df.analysis_smote
+
+# Filter
+df.analysis_smote <- df.analysis_smote %>%
+  mutate(irregularity = as.factor(irregularity_smote)) %>%
+  select(-irregularity_smote)
+
+
+# Splitting the data
+split_testing_smote <- initial_split(
+  data = df.analysis_smote, prop = .8,
+  strata = irregularity # Stratisfy on irregularity to 
+                        # make sure there are enough fraud cases
+)
+
+df.analysis_test_smote <- testing(split_testing_smote)
+df.analysis_train_assess_smote <- training(split_testing_smote)
+
+
+# Splitting the data
+split_assessment_smote <- initial_split(
+  data = df.analysis_train_assess_smote, prop = .6,
+  strata = irregularity # Stratisfy on irregularity to 
+                        # make sure there are enough fraud cases
+)
+
+
+
+df.analysis_train_smote <- training(split_assessment_smote)
+df.analysis_assess_smote <- testing(split_assessment_smote)
+
+
+
+
+
+# Cross validation
+cv_folds_smote <- df.analysis_train_smote %>% vfold_cv(v = 5, strata = irregularity) # Stratisfy on irregularity to
+                                                                                     # make sure there are enough 
+                                                                                     # fraud cases in each fold
+
+```
+
+
+# Data frame for outcomes
+```{r}
+comparison_df <- data.frame("Metric" = c("True Positive Rate", "False Positive Rate",
+                                         "Total Cost", "Average Cost", "Scaled TPR", "Scaled FPR",
+                                         "Correlation"))
+```
+
+
+# Random forest model (DS)
+```{r}
+# Recipe definition
+rf_recipe <- recipe(irregularity ~ ., data = df.analysis_train) %>%
+  update_role(gvkey, year, sic, irregularity_bin, AUDIT_FEES, AUDITOR_FKEY, new_role = "metadata") %>%
+  themis::step_downsample(irregularity) 
+```
+
+```{r}
+# Tuning recipe
+rf_model_tune <- rand_forest(mtry = tune(), trees = 500) %>%
+  set_mode("classification") %>%
+  set_engine("ranger", importance = "permutation")
+```
+
+```{r}
+# Workflow
+rf_tune_wf <-
+  workflow() |>
+  add_recipe(rf_recipe) |>
+  add_model(rf_model_tune)
+```
+
+```{r}
+# Metrics
+class_metrics <- metric_set(
+  accuracy, kap, sensitivity,
+  specificity, roc_auc
+)
+```
+
+```{r}
+# Tuning
+rf_tune_grid <- grid_regular(mtry(range = c(1, 15)), levels = 15)
+
+num_cores <- parallel::detectCores()
+num_cores
+
+doParallel::registerDoParallel(cores = num_cores - 1L)
+
+
+rf_tune_res <- tune_grid(
+  rf_tune_wf,
+  resamples = cv_folds,
+  grid = rf_tune_grid,
+  metrics = class_metrics
+)
+```
+
+```{r}
+# Tuning results
+rf_tune_res |>
+  collect_metrics()
+```
+
+```{r}
+# Selecting best model and finalizing workflow
+best_rf <- select_best(rf_tune_res, "sensitivity")
+
+rf_final_wf <- finalize_workflow(rf_tune_wf, best_rf)
+
+rf_assessment_fit <- 
+  rf_final_wf |>
+  last_fit(split_assessment, metrics = class_metrics)
+```
+
+```{r}
+rf_assessment_fit %>%
+  collect_metrics()
+```
+
+
+## Setting threshold
+I opt for a threshold of 45%, as the sensitivity is the main driver of high costs. 
+```{r}
+# Setting threshold
+## Collect the predictions
+predictions <- rf_assessment_fit |>
+  collect_predictions()
+
+predictions_df <- data.frame('irregularity' = predictions$irregularity,
+                           'pred_irregularity' = predictions$.pred_1,
+                           'pred_regular' = predictions$.pred_0)
+
+# Create predictions at various thresholds
+thresholds <- c(0.2, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.7, 0.8, 0.9)
+for (threshold in thresholds) {
+  col_name <- paste0("pred_stat", threshold * 100)
+  predictions_df[[col_name]] <- as.factor(ifelse(predictions_df$pred_irregularity > threshold, 1, 0))
+}
+
+# Function to manually calculate sensitivity and specificity
+calculate_metrics <- function(true_labels, predicted_labels) {
+  cm <- table(True = true_labels, Predicted = predicted_labels)
+  TP <- cm[2, 2]
+  FN <- cm[2, 1]
+  TN <- cm[1, 1]
+  FP <- cm[1, 2]
+  
+  sensitivity <- TP / (TP + FN)
+  specificity <- TN / (TN + FP)
+  
+  return(c(sensitivity = sensitivity, specificity = specificity))
+}
+
+# Calculate metrics for each threshold
+metrics_list <- lapply(thresholds, function(threshold) {
+  col_name <- paste0("pred_stat", threshold * 100)
+  calculate_metrics(predictions_df$irregularity, predictions_df[[col_name]])
+})
+
+# Create a dataframe with the results
+metrics_df <- do.call(rbind, metrics_list)
+metrics_df <- data.frame(Threshold = thresholds * 100, metrics_df)
+metrics_df <- metrics_df %>%
+  mutate(sensitivity = round(sensitivity, 3),
+         specificity = round(specificity, 3))
+
+# Plot the dataframe
+metrics_df %>%
+  pivot_longer(cols = -Threshold, names_to = "Measure", values_to = "Value") %>%
+  ggplot(aes(x = Threshold, y = Value, color = Measure)) +
+  geom_line() +
+  geom_point() +
+  theme_bw() +
+  scale_color_manual(values = c("sensitivity" = "blue", "specificity" = "red"),
+                     labels = c("Sensitivity", "Specificity"),
+                     name = "Measure") +
+  labs(x = "Threshold (%)",
+       y = "Value") +
+  scale_x_continuous(breaks = seq(20, 90, by = 5))
+```
+## Fit on the test data
+```{r}
+rf_final_fit <- rf_final_wf %>%
+  last_fit(split_testing, metrics = class_metrics)
+```
+
+## Metrics
+```{r}
+# Creating dataframe including the costs
+df.outcomes <-  rf_final_fit %>%
+  collect_predictions() %>%
+  select(irregularity,
+         .pred_1) %>%
+  rename(soft = .pred_1) %>%
+  mutate(hard = as.factor(ifelse(soft > .45, 1, 0))) %>%
+  mutate(cost = ifelse(irregularity == 1 & hard == 0, "FN",
+                              ifelse(irregularity == 0 & hard == 1, "FP",
+                                     0)))
+
+# Costs
+FN_C <- df.outcomes %>% filter(cost == "FN") %>% pull() %>% length() * 122
+FP_C <- df.outcomes %>% filter(cost == "FP") %>% pull() %>% length() * 1
+
+# Calculating metrics
+metrics <- calculate_metrics(df.outcomes$irregularity, df.outcomes$hard)
+
+
+
+# TPR (Sensitivity)
+tpr <- round(metrics[[1]], 2)
+
+# FPR (1 - Specificity)
+fpr <- round(metrics[[2]], 2)
+
+# Total cost
+tc <- FN_C + FP_C
+
+# Scaled TPR
+s_tpr <- round(tpr / (tc/nrow(df.outcomes)), 2)
+
+# Scaled FPR
+s_fpr <- round(fpr / (tc/nrow(df.outcomes)), 2)
+
+# Average cost
+ac <- round(tc / nrow(df.outcomes), 2)
+
+# Correlation
+cor <- cor(df.analysis_test$FEES_AT, df.outcomes$soft)
+
+# Setting up the dataframe
+final_comparison_metrics_rf <- data.frame("RF" = c(tpr, fpr, tc, ac, s_tpr, s_fpr, cor))
+
+# Binding to comparison df
+comparison_df <- cbind(comparison_df, final_comparison_metrics_rf)
+```
+
+## Feature importance scores
+```{r}
+# Feature importance scores
+vip_rf_reg_ds <- rf_final_fit |>
+  extract_fit_parsnip() |>
+  vip::vip(geom = "point", num_features = 5) +
+  labs(title = "Regular Random forest") +
+  theme_classic() +
+    theme(
+    text = element_text(family = "Times New Roman", size = 16))
+
+```
+
+## ROC AUC
+```{r}
+roc <- rf_final_fit |>
+  collect_predictions() |>
+  roc_curve(truth = irregularity, .pred_1) |>
+  autoplot()
+
+ggsave(file = "plots/roc_rf.png", plot = roc, width = 4, height = 4)
+
+rf_final_fit |> collect_metrics()
+```
+
+# Random forest model (SMOTE)
+```{r}
+# Recipe definition
+rf_recipe <- recipe(irregularity ~ ., data = df.analysis_train_smote) %>%
+  update_role(gvkey, year, sic, AUDIT_FEES, AUDITOR_FKEY, new_role = "metadata") %>%
+  themis::step_downsample(irregularity) 
+```
+
+```{r}
+# Tuning recipe
+rf_model_tune <- rand_forest(mtry = tune(), trees = 500) %>%
+  set_mode("classification") %>%
+  set_engine("ranger", importance = "permutation")
+```
+
+```{r}
+# Workflow
+rf_tune_wf <-
+  workflow() |>
+  add_recipe(rf_recipe) |>
+  add_model(rf_model_tune)
+```
+
+```{r}
+# Metrics
+class_metrics <- metric_set(
+  accuracy, kap, sensitivity,
+  specificity, roc_auc
+)
+```
+
+```{r}
+# Tuning
+rf_tune_grid <- grid_regular(mtry(range = c(1, 15)), levels = 15)
+
+num_cores <- parallel::detectCores()
+num_cores
+
+doParallel::registerDoParallel(cores = num_cores - 1L)
+
+
+rf_tune_res <- tune_grid(
+  rf_tune_wf,
+  resamples = cv_folds_smote,
+  grid = rf_tune_grid,
+  metrics = class_metrics
+)
+```
+
+```{r}
+# Tuning results
+rf_tune_res |>
+  collect_metrics()
+```
+
+```{r}
+# Selecting best model and finalizing workflow
+best_rf <- select_best(rf_tune_res, "sensitivity")
+
+rf_final_wf <- finalize_workflow(rf_tune_wf, best_rf)
+
+rf_assessment_fit <- 
+  rf_final_wf |>
+  last_fit(split_assessment_smote, metrics = class_metrics)
+```
+
+```{r}
+rf_assessment_fit %>%
+  collect_metrics()
+```
+
+## Setting threshold
+I opt for a threshold of 30%, as the sensitivity is the main driver of high costs. 
+```{r}
+# Setting threshold
+## Collect the predictions
+predictions <- rf_assessment_fit |>
+  collect_predictions()
+
+predictions_df <- data.frame('irregularity' = predictions$irregularity,
+                           'pred_irregularity' = predictions$.pred_1,
+                           'pred_regular' = predictions$.pred_0)
+
+# Create predictions at various thresholds
+thresholds <- c(0.2, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.7, 0.8, 0.9)
+for (threshold in thresholds) {
+  col_name <- paste0("pred_stat", threshold * 100)
+  predictions_df[[col_name]] <- as.factor(ifelse(predictions_df$pred_irregularity > threshold, 1, 0))
+}
+
+# Function to manually calculate sensitivity and specificity
+calculate_metrics <- function(true_labels, predicted_labels) {
+  cm <- table(True = true_labels, Predicted = predicted_labels)
+  TP <- cm[2, 2]
+  FN <- cm[2, 1]
+  TN <- cm[1, 1]
+  FP <- cm[1, 2]
+  
+  sensitivity <- TP / (TP + FN)
+  specificity <- TN / (TN + FP)
+  
+  return(c(sensitivity = sensitivity, specificity = specificity))
+}
+
+# Calculate metrics for each threshold
+metrics_list <- lapply(thresholds, function(threshold) {
+  col_name <- paste0("pred_stat", threshold * 100)
+  calculate_metrics(predictions_df$irregularity, predictions_df[[col_name]])
+})
+
+# Create a dataframe with the results
+metrics_df <- do.call(rbind, metrics_list)
+metrics_df <- data.frame(Threshold = thresholds * 100, metrics_df)
+metrics_df <- metrics_df %>%
+  mutate(sensitivity = round(sensitivity, 3),
+         specificity = round(specificity, 3))
+
+# Plot the dataframe
+metrics_df %>%
+  pivot_longer(cols = -Threshold, names_to = "Measure", values_to = "Value") %>%
+  ggplot(aes(x = Threshold, y = Value, color = Measure)) +
+  geom_line() +
+  geom_point() +
+  theme_bw() +
+  scale_color_manual(values = c("sensitivity" = "blue", "specificity" = "red"),
+                     labels = c("Sensitivity", "Specificity"),
+                     name = "Measure") +
+  labs(x = "Threshold (%)",
+       y = "Value") +
+  scale_x_continuous(breaks = seq(20, 90, by = 5))
+```
+## Fit on the test data
+```{r}
+rf_final_fit <- rf_final_wf %>%
+  last_fit(split_testing_smote, metrics = class_metrics)
+```
+
+## Metrics
+```{r}
+# Creating dataframe including the costs
+df.outcomes <-  rf_final_fit %>%
+  collect_predictions() %>%
+  select(irregularity,
+         .pred_1) %>%
+  rename(soft = .pred_1) %>%
+  mutate(hard = as.factor(ifelse(soft > .30, 1, 0))) %>%
+  mutate(cost = ifelse(irregularity == 1 & hard == 0, "FN",
+                              ifelse(irregularity == 0 & hard == 1, "FP",
+                                     0)))
+
+# Costs
+FN_C <- df.outcomes %>% filter(cost == "FN") %>% pull() %>% length() * 122
+FP_C <- df.outcomes %>% filter(cost == "FP") %>% pull() %>% length() * 1
+
+# Calculating metrics
+metrics <- calculate_metrics(df.outcomes$irregularity, df.outcomes$hard)
+
+
+
+# TPR (Sensitivity)
+tpr <- round(metrics[[1]], 2)
+
+# FPR (1 - Specificity)
+fpr <- round(metrics[[2]], 2)
+
+# Total cost
+tc <- FN_C + FP_C
+
+# Scaled TPR
+s_tpr <- round(tpr / (tc/nrow(df.outcomes)), 2)
+
+# Scaled FPR
+s_fpr <- round(fpr / (tc/nrow(df.outcomes)), 2)
+
+# Average cost
+ac <- round(tc / nrow(df.outcomes), 2)
+
+# Correlation
+cor <- cor(df.analysis_test_smote$FEES_AT, df.outcomes$soft)
+
+# Setting up the dataframe
+final_comparison_metrics_rf_smote <- data.frame("RF_smote" = c(tpr, fpr, tc, ac, s_tpr, s_fpr, cor))
+
+# Binding to comparison df
+comparison_df <- cbind(comparison_df, final_comparison_metrics_rf_smote)
+```
+
+### LM
+```{r}
+data_lm <- data.frame("fees" = df.analysis_test_smote$AUDIT_FEES,
+                      "size" = df.analysis_test_smote$AUDIT_FEES / df.analysis_test_smote$FEES_AT,
+                      "lev" = df.analysis_test_smote$lvgi,
+                      "pred" = df.outcomes$soft)
+
+reg_lm <- lm(log(fees) ~ pred + size + lev, data = data_lm)
+```
+
+## Feature importance scores
+```{r}
+# Feature importance scores
+vip_rf_reg_smote <- rf_final_fit |>
+  extract_fit_parsnip() |>
+  vip::vip(geom = "point", num_features = 5) +
+  labs(title = "Regular Random forest") +
+  theme_classic() +
+    theme(
+    text = element_text(family = "Times New Roman", size = 16))
+
+```
+
+## ROC AUC
+```{r}
+roc <- rf_final_fit |>
+  collect_predictions() |>
+  roc_curve(truth = irregularity, .pred_1) |>
+  autoplot()
+
+ggsave(file = "plots/roc_rf_smote.png", plot = roc, width = 4, height = 4)
+
+rf_final_fit |> collect_metrics()
+```
+
+
+```{r}
+ggsave("plots/vip_regular_models.png", plot = arrangeGrob(vip_rf_reg_ds, vip_rf_reg_smote, nrow = 1), width = 12, height = 3)
+```
+
+
+# CS Random forest static (DS)
+```{r}
+# Recipe definition
+rf_recipe <- recipe(irregularity ~ ., data = df.analysis_train) %>%
+  update_role(gvkey, year, sic, irregularity_bin, AUDIT_FEES, AUDITOR_FKEY, new_role = "metadata") %>%
+  themis::step_downsample(irregularity) 
+```
+
+```{r}
+# Tuning recipe
+rf_model_tune <- rand_forest(mtry = tune(), trees = 500) %>%
+  set_mode("classification") %>%
+  set_engine("ranger", importance = "permutation", class.weights = c("1" = 122, "0" = 1))
+```
+
+```{r}
+# Workflow
+rf_tune_wf <-
+  workflow() |>
+  add_recipe(rf_recipe) |>
+  add_model(rf_model_tune)
+```
+
+```{r}
+# Metrics
+class_metrics <- metric_set(
+  accuracy, kap, sensitivity,
+  specificity, roc_auc
+)
+```
+
+```{r}
+# Tuning
+rf_tune_grid <- grid_regular(mtry(range = c(1, 15)), levels = 15)
+
+num_cores <- parallel::detectCores()
+num_cores
+
+doParallel::registerDoParallel(cores = num_cores - 1L)
+
+
+rf_tune_res <- tune_grid(
+  rf_tune_wf,
+  resamples = cv_folds,
+  grid = rf_tune_grid,
+  metrics = class_metrics
+)
+```
+
+```{r}
+# Tuning results
+rf_tune_res |>
+  collect_metrics()
+```
+
+```{r}
+# Selecting best model and finalizing workflow
+best_rf <- select_best(rf_tune_res, "sensitivity")
+
+rf_final_wf <- finalize_workflow(rf_tune_wf, best_rf)
+
+rf_assessment_fit <- 
+  rf_final_wf |>
+  last_fit(split_assessment, metrics = class_metrics)
+```
+
+```{r}
+rf_assessment_fit %>%
+  collect_metrics()
+```
+
+## Setting threshold
+I opt for a threshold of 40%, as the sensitivity is the main driver of high costs. 
+```{r}
+# Setting threshold
+## Collect the predictions
+predictions <- rf_assessment_fit |>
+  collect_predictions()
+
+predictions_df <- data.frame('irregularity' = predictions$irregularity,
+                           'pred_irregularity' = predictions$.pred_1,
+                           'pred_regular' = predictions$.pred_0)
+
+# Create predictions at various thresholds
+thresholds <- c(0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.7)
+for (threshold in thresholds) {
+  col_name <- paste0("pred_stat", threshold * 100)
+  predictions_df[[col_name]] <- as.factor(ifelse(predictions_df$pred_irregularity > threshold, 1, 0))
+}
+
+# Function to manually calculate sensitivity and specificity
+calculate_metrics <- function(true_labels, predicted_labels) {
+  cm <- table(True = true_labels, Predicted = predicted_labels)
+  TP <- cm[2, 2]
+  FN <- cm[2, 1]
+  TN <- cm[1, 1]
+  FP <- cm[1, 2]
+  
+  sensitivity <- TP / (TP + FN)
+  specificity <- TN / (TN + FP)
+  
+  return(c(sensitivity = sensitivity, specificity = specificity))
+}
+
+# Calculate metrics for each threshold
+metrics_list <- lapply(thresholds, function(threshold) {
+  col_name <- paste0("pred_stat", threshold * 100)
+  calculate_metrics(predictions_df$irregularity, predictions_df[[col_name]])
+})
+
+# Create a dataframe with the results
+metrics_df <- do.call(rbind, metrics_list)
+metrics_df <- data.frame(Threshold = thresholds * 100, metrics_df)
+metrics_df <- metrics_df %>%
+  mutate(sensitivity = round(sensitivity, 3),
+         specificity = round(specificity, 3))
+
+# Plot the dataframe
+metrics_df %>%
+  pivot_longer(cols = -Threshold, names_to = "Measure", values_to = "Value") %>%
+  ggplot(aes(x = Threshold, y = Value, color = Measure)) +
+  geom_line() +
+  geom_point() +
+  theme_bw() +
+  scale_color_manual(values = c("sensitivity" = "blue", "specificity" = "red"),
+                     labels = c("Sensitivity", "Specificity"),
+                     name = "Measure") +
+  labs(x = "Threshold (%)",
+       y = "Value") +
+  scale_x_continuous(breaks = seq(30, 70, by = 5))
+```
+
+
+## Fit on the test data
+```{r}
+rf_final_fit <- rf_final_wf %>%
+  last_fit(split_testing, metrics = class_metrics)
+```
+
+## Metrics
+```{r}
+# Creating dataframe including the costs
+df.outcomes <-  rf_final_fit %>%
+  collect_predictions() %>%
+  select(irregularity,
+         .pred_1) %>%
+  rename(soft = .pred_1) %>%
+  mutate(hard = as.factor(ifelse(soft > .40, 1, 0))) %>%
+  mutate(cost = ifelse(irregularity == 1 & hard == 0, "FN",
+                              ifelse(irregularity == 0 & hard == 1, "FP",
+                                     0)))
+
+# Costs
+FN_C <- df.outcomes %>% filter(cost == "FN") %>% pull() %>% length() * 122
+FP_C <- df.outcomes %>% filter(cost == "FP") %>% pull() %>% length() * 1
+
+# Calculating metrics
+metrics <- calculate_metrics(df.outcomes$irregularity, df.outcomes$hard)
+
+
+
+# TPR (Sensitivity)
+tpr <- round(metrics[[1]], 2)
+
+# FPR (1 - Specificity)
+fpr <- round(metrics[[2]], 2)
+
+# Total cost
+tc <- FN_C + FP_C
+
+# Scaled TPR
+s_tpr <- round(tpr / (tc/nrow(df.outcomes)), 2)
+
+# Scaled FPR
+s_fpr <- round(fpr / (tc/nrow(df.outcomes)), 2)
+
+# Average cost
+ac <- round(tc / nrow(df.outcomes), 2)
+
+# Correlation
+cor <- cor(df.analysis_test$FEES_AT, df.outcomes$soft)
+
+# Setting up the dataframe
+final_comparison_metrics_rf_SCS <- data.frame("RF_SC_REG" = c(tpr, fpr, tc, ac, s_tpr, s_fpr, cor))
+
+# Binding to comparison df
+comparison_df <- cbind(comparison_df, final_comparison_metrics_rf_SCS)
+```
+### LM
+```{r}
+data_lm <- data.frame("fees" = df.analysis_test$AUDIT_FEES,
+                      "size" = df.analysis_test$AUDIT_FEES / df.analysis_test$FEES_AT,
+                      "lev" = df.analysis_test$lvgi,
+                      "pred" = df.outcomes$soft)
+
+scs_lm <- lm(log(fees) ~ pred + size + lev, data = data_lm)
+```
+
+## Feature importance scores
+```{r}
+# Feature importance scores
+vip_rf_scs <- rf_final_fit |>
+  extract_fit_parsnip() |>
+  vip::vip(geom = "point", num_features = 6) +
+  labs(title = "") +
+  theme_classic() +
+    theme(
+    text = element_text(family = "Times New Roman", size = 16))
+
+ggsave(file = "plots/vip_rf_scs.png", plot = vip_rf_scs, width = 6, height = 3)
+
+```
+
+## PDP
+```{r}
+final_model <- extract_fit_parsnip(rf_final_fit)
+
+# Create an explainer object using DALEX
+explainer_rf <- explain(
+  model = final_model,
+  data = dplyr::select(df.analysis_test, -irregularity),
+  y = df.analysis_test$irregularity,
+  label = "Random Forest"
+)
+
+# Generate Partial Dependence Plots for selected features
+pdp_rf <- model_profile(
+  explainer = explainer_rf,
+  variables = c("rect_turn", "rect_act", "rec_sales", "de_ratio", "debt_assets", "AUDITOR_RESIGN")#, "AUDITOR_RESIGN", "rd_sale", "RES_IMPROVES", "AUDITOR_BIG4") # Replace with your feature names
+)
+
+pdp_rf_scs <- plot_single_partial_dependence_ggplot(pdp_rf)
+
+ggsave(file = "plots/pdp_rf_scs.png", plot = pdp_rf_scs, width = 8, height = 4)
+
+```
+
+## ROC AUC
+```{r}
+roc <- rf_final_fit |>
+  collect_predictions() |>
+  roc_curve(truth = irregularity, .pred_1) |>
+  autoplot()
+
+ggsave(file = "plots/roc_rf_scs.png", plot = roc, width = 4, height = 4)
+
+rf_final_fit |> collect_metrics()
+```
+
+
+# CS Random forest static (SMOTE)
+```{r}
+# Recipe definition
+rf_recipe <- recipe(irregularity ~ ., data = df.analysis_train_smote) %>%
+  update_role(gvkey, year, sic, AUDIT_FEES, AUDITOR_FKEY, new_role = "metadata") %>%
+  themis::step_downsample(irregularity) 
+```
+
+```{r}
+# Tuning recipe
+rf_model_tune <- rand_forest(mtry = tune(), trees = 500) %>%
+  set_mode("classification") %>%
+  set_engine("ranger", importance = "permutation", class.weights = c("1" = 122, "0" = 1))
+```
+
+```{r}
+# Workflow
+rf_tune_wf <-
+  workflow() |>
+  add_recipe(rf_recipe) |>
+  add_model(rf_model_tune)
+```
+
+```{r}
+# Metrics
+class_metrics <- metric_set(
+  accuracy, kap, sensitivity,
+  specificity, roc_auc
+)
+```
+
+```{r}
+# Tuning
+rf_tune_grid <- grid_regular(mtry(range = c(1, 15)), levels = 15)
+
+num_cores <- parallel::detectCores()
+num_cores
+
+doParallel::registerDoParallel(cores = num_cores - 1L)
+
+
+rf_tune_res <- tune_grid(
+  rf_tune_wf,
+  resamples = cv_folds_smote,
+  grid = rf_tune_grid,
+  metrics = class_metrics
+)
+```
+
+```{r}
+# Tuning results
+rf_tune_res |>
+  collect_metrics()
+```
+
+```{r}
+# Selecting best model and finalizing workflow
+best_rf <- select_best(rf_tune_res, "sensitivity")
+
+rf_final_wf <- finalize_workflow(rf_tune_wf, best_rf)
+
+rf_assessment_fit <- 
+  rf_final_wf |>
+  last_fit(split_assessment_smote, metrics = class_metrics)
+```
+
+```{r}
+rf_assessment_fit %>%
+  collect_metrics()
+```
+
+## Setting threshold
+I opt for a threshold of 30%, as the sensitivity is the main driver of high costs. 
+```{r}
+# Setting threshold
+## Collect the predictions
+predictions <- rf_assessment_fit |>
+  collect_predictions()
+
+predictions_df <- data.frame('irregularity' = predictions$irregularity,
+                           'pred_irregularity' = predictions$.pred_1,
+                           'pred_regular' = predictions$.pred_0)
+
+# Create predictions at various thresholds
+thresholds <- c(0.2, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.7, 0.8, 0.9)
+for (threshold in thresholds) {
+  col_name <- paste0("pred_stat", threshold * 100)
+  predictions_df[[col_name]] <- as.factor(ifelse(predictions_df$pred_irregularity > threshold, 1, 0))
+}
+
+# Function to manually calculate sensitivity and specificity
+calculate_metrics <- function(true_labels, predicted_labels) {
+  cm <- table(True = true_labels, Predicted = predicted_labels)
+  TP <- cm[2, 2]
+  FN <- cm[2, 1]
+  TN <- cm[1, 1]
+  FP <- cm[1, 2]
+  
+  sensitivity <- TP / (TP + FN)
+  specificity <- TN / (TN + FP)
+  
+  return(c(sensitivity = sensitivity, specificity = specificity))
+}
+
+# Calculate metrics for each threshold
+metrics_list <- lapply(thresholds, function(threshold) {
+  col_name <- paste0("pred_stat", threshold * 100)
+  calculate_metrics(predictions_df$irregularity, predictions_df[[col_name]])
+})
+
+# Create a dataframe with the results
+metrics_df <- do.call(rbind, metrics_list)
+metrics_df <- data.frame(Threshold = thresholds * 100, metrics_df)
+metrics_df <- metrics_df %>%
+  mutate(sensitivity = round(sensitivity, 3),
+         specificity = round(specificity, 3))
+
+# Plot the dataframe
+metrics_df %>%
+  pivot_longer(cols = -Threshold, names_to = "Measure", values_to = "Value") %>%
+  ggplot(aes(x = Threshold, y = Value, color = Measure)) +
+  geom_line() +
+  geom_point() +
+  theme_bw() +
+  scale_color_manual(values = c("sensitivity" = "blue", "specificity" = "red"),
+                     labels = c("Sensitivity", "Specificity"),
+                     name = "Measure") +
+  labs(x = "Threshold (%)",
+       y = "Value") +
+  scale_x_continuous(breaks = seq(20, 90, by = 5))
+```
+
+
+## Fit on the test data
+```{r}
+rf_final_fit <- rf_final_wf %>%
+  last_fit(split_testing_smote, metrics = class_metrics)
+```
+
+## Metrics
+```{r}
+# Creating dataframe including the costs
+df.outcomes <-  rf_final_fit %>%
+  collect_predictions() %>%
+  select(irregularity,
+         .pred_1) %>%
+  rename(soft = .pred_1) %>%
+  mutate(hard = as.factor(ifelse(soft > .30, 1, 0))) %>%
+  mutate(cost = ifelse(irregularity == 1 & hard == 0, "FN",
+                              ifelse(irregularity == 0 & hard == 1, "FP",
+                                     0)))
+
+# Costs
+FN_C <- df.outcomes %>% filter(cost == "FN") %>% pull() %>% length() * 122
+FP_C <- df.outcomes %>% filter(cost == "FP") %>% pull() %>% length() * 1
+
+# Calculating metrics
+metrics <- calculate_metrics(df.outcomes$irregularity, df.outcomes$hard)
+
+
+
+# TPR (Sensitivity)
+tpr <- round(metrics[[1]], 2)
+
+# FPR (1 - Specificity)
+fpr <- round(metrics[[2]], 2)
+
+# Total cost
+tc <- FN_C + FP_C
+
+# Scaled TPR
+s_tpr <- round(tpr / (tc/nrow(df.outcomes)), 2)
+
+# Scaled FPR
+s_fpr <- round(fpr / (tc/nrow(df.outcomes)), 2)
+
+# Average cost
+ac <- round(tc / nrow(df.outcomes), 2)
+
+# Correlation
+cor <- cor(df.analysis_test_smote$FEES_AT, df.outcomes$soft)
+
+# Setting up the dataframe
+final_comparison_metrics_rf_SCS_smote <- data.frame("RF_SC_SMOTE" = c(tpr, fpr, tc, ac, s_tpr, s_fpr, cor))
+
+# Binding to comparison df
+comparison_df <- cbind(comparison_df, final_comparison_metrics_rf_SCS_smote)
+```
+
+
+
+
+## Feature importance scores
+```{r}
+# Feature importance scores
+vip_rf_scs_sm <- rf_final_fit |>
+  extract_fit_parsnip() |>
+  vip::vip(geom = "point", num_features = 6) +
+  labs(title = "") +
+  theme_classic() +
+    theme(
+    text = element_text(family = "Times New Roman", size = 16))
+
+ggsave(file = "plots/vip_rf_scs_smote.png", plot = vip_rf_scs_sm, width = 6, height = 3)
+
+```
+
+## PDP
+```{r}
+final_model <- extract_fit_parsnip(rf_final_fit)
+
+# Create an explainer object using DALEX
+explainer_rf <- explain(
+  model = final_model,
+  data = dplyr::select(df.analysis_test_smote, -irregularity),
+  y = df.analysis_test_smote$irregularity,
+  label = "Random Forest"
+)
+
+# Generate Partial Dependence Plots for selected features
+pdp_rf <- model_profile(
+  explainer = explainer_rf,
+  variables = c("manuf_company", "AUDITOR_RESIGN", "rd_sale", "RES_ADVERSE", "RES_IMPROVES", "AUDITOR_BIG4")#, "AUDITOR_RESIGN", "rd_sale", "RES_IMPROVES", "AUDITOR_BIG4") # Replace with your feature names
+)
+
+pdp_rf_scs_smote <- plot_single_partial_dependence_ggplot(pdp_rf)
+
+ggsave(file = "plots/pdp_rf_scs_smote.png", plot = pdp_rf_scs_smote, width = 8, height = 4)
+
+```
+
+## ROC AUC
+```{r}
+roc <- rf_final_fit |>
+  collect_predictions() |>
+  roc_curve(truth = irregularity, .pred_1) |>
+  autoplot()
+
+ggsave(file = "plots/roc_rf_scs_smote.png", plot = roc, width = 4, height = 4)
+
+rf_final_fit |> collect_metrics()
+```
+
+
+# SAVING PERFORMANCE FIRST 4
+```{r}
+save(comparison_df, file = "comparison_df_first_4.RData")
+```
+
+
+
+
+# CS Random forest dynamic (DS)
+## Setting seed
+```{r}
+set.seed(123)
+```
+## Creating splits and adding case weights
+### Regular model
+```{r}
+# REGULAR ######################################################################
+df.analysis_dc <- df.analysis %>%
+  mutate(AUDIT_FEES = AUDIT_FEES / 1000000) %>%
+  filter(irregularity != 2) %>%
+  select(-gvkey, 
+         -year, 
+         -sic, 
+         -AUDITOR_FKEY,
+         -irregularity_bin)
+
+# Downsampling the data
+class_counts <- df.analysis_dc %>%
+  count(irregularity) %>%
+  arrange(n)
+
+# Number of samples to match from the minority class
+n_samples <- min(class_counts$n)
+
+# Separate the data into majority and minority datasets
+minority_data <- df.analysis_dc %>%
+  filter(irregularity == class_counts$irregularity[1])
+
+majority_data <- df.analysis_dc %>%
+  filter(irregularity == class_counts$irregularity[2])
+
+# Downsample the majority class
+majority_data_downsampled <- majority_data %>%
+  sample_n(size = n_samples, replace = FALSE)
+
+# Combine back the downsampled majority class and minority class
+df.analysis_dc <- bind_rows(minority_data, majority_data_downsampled)
+
+
+split_dynamic_dc <- initial_split(df.analysis_dc, prop = .8,
+                                     strata = irregularity)
+
+dc_training_assessment <- training(split_dynamic_dc)
+
+
+
+# case weights for the training_assessment data
+dc_training_assessment <- dc_training_assessment %>%
+  mutate(cost = ifelse(irregularity == 1, 
+                       146.77, 
+                       (0.03*(AUDIT_FEES*0.23))+(0.97*((AUDIT_FEES*0.23)*0.77))+0.27+0.93)) %>%
+  mutate(weight = cost) %>%
+  select(-cost)
+
+# testing data
+dc_testing <- testing(split_dynamic_dc)
+dc_testing <- dc_testing %>%
+  mutate(weight = rep(0, nrow(dc_testing)))
+
+dc_testing_filt <- dc_testing %>%
+  select(-AUDIT_FEES)
+
+
+split_dynamic_dc_training <- initial_split(dc_training_assessment, prop = .8,
+                                           strata = irregularity)
+
+
+
+dc_training <- training(split_dynamic_dc_training)
+
+# case weights for training data
+dc_training <- dc_training %>%
+  mutate(cost = ifelse(irregularity == 1, 
+                       146.77, 
+                       (0.03*(AUDIT_FEES*0.23)+(0.97*((AUDIT_FEES*0.23)*0.77))+0.27+0.93))) %>%
+  mutate(weight = cost) %>%
+  select(-cost,
+         -AUDIT_FEES)
+
+# assessment data
+dc_assess <- testing(split_dynamic_dc_training)
+dc_assess <- dc_assess %>%
+  select(-AUDIT_FEES) %>%
+  mutate(weight = rep(0, nrow(dc_assess)))
+
+dc_training_assessment <- dc_training_assessment %>%
+  select(-AUDIT_FEES)
+
+
+```
+
+### SMOTE model
+```{r}
+# SMOTE ######################################################################
+df.analysis_dc_smote <- df.analysis_smote_orig %>%
+  mutate(AUDIT_FEES = AUDIT_FEES / 1000000) %>%
+  filter(irregularity != 2) %>%
+  select(-gvkey, 
+         -year, 
+         -sic, 
+         -AUDITOR_FKEY,
+         -irregularity) %>%
+  mutate(irregularity_smote = as.factor(irregularity_smote))
+
+
+# Splitting the data
+split_dynamic_dc_smote <- initial_split(df.analysis_dc_smote, prop = .8,
+                                     strata = irregularity_smote)
+
+dc_training_assessment_smote <- training(split_dynamic_dc_smote)
+
+
+
+# case weights for the training_assessment data
+dc_training_assessment_smote <- dc_training_assessment_smote %>%
+  mutate(cost = ifelse(irregularity_smote == 1, 
+                       146.77, 
+                       (0.03*(AUDIT_FEES*0.23)+(0.97*((AUDIT_FEES*0.23)*0.77))+0.27+0.93))) %>%
+  mutate(weight = cost) %>%
+  select(-cost)
+
+# testing data
+dc_testing_smote <- testing(split_dynamic_dc_smote)
+dc_testing_smote <- dc_testing_smote %>%
+  mutate(weight = rep(0, nrow(dc_testing_smote)))
+
+dc_testing_smote_filt <- dc_testing_smote %>%
+  select(-AUDIT_FEES)
+
+
+split_dynamic_dc_training_smote <- initial_split(dc_training_assessment_smote, prop = .8,
+                                           strata = irregularity_smote)
+
+
+
+dc_training_smote <- training(split_dynamic_dc_training_smote)
+
+# case weights for training data
+dc_training_smote <- dc_training_smote %>%
+  mutate(cost = ifelse(irregularity_smote == 1, 
+                       146.77, 
+                       (0.03*(AUDIT_FEES*0.23)+(0.97*((AUDIT_FEES*0.23)*0.77))+0.27+0.93))) %>%
+  mutate(weight = cost) %>%
+  select(-cost,
+         -AUDIT_FEES)
+
+# assessment data
+dc_assess_smote <- testing(split_dynamic_dc_training_smote)
+dc_assess_smote <- dc_assess_smote %>%
+  select(-AUDIT_FEES) %>%
+  mutate(weight = rep(0, nrow(dc_assess_smote)))
+
+dc_training_assessment_smote <- dc_training_assessment_smote %>%
+  select(-AUDIT_FEES)
+
+
+```
+
+## Regular model building
+```{r}
+# Normalizing weights
+dc_training <- dc_training %>% 
+  mutate(weight_ln = log(weight)) %>%
+  mutate(weight = weight_ln / sum(weight_ln)) %>%
+  select(-weight_ln)
+  
+
+# Regular
+rf_model <- ranger(
+    formula = irregularity ~ .,  # Assuming 'irregularity' is the target variable
+    data = dplyr::select(dc_training, -weight),
+    case.weights = dc_training$weight,
+    num.trees = 500,
+    mtry = 9,
+    importance = 'permutation',
+    probability = TRUE  # if you need probability estimates
+)
+
+```
+### Predicting on testing data
+```{r}
+test_predictions <- predict(rf_model, dc_assess)
+```
+
+### Setting threshold
+
+```{r}
+predictions_df <- data.frame('irregularity' = as.factor(dc_assess$irregularity),
+                           'pred_irregularity' = test_predictions$predictions[,2])
+
+# Create predictions at various thresholds
+thresholds <- c(0.5, 0.55, 0.6, 0.7, 0.8, 0.9)
+for (threshold in thresholds) {
+  col_name <- paste0("pred_stat", threshold * 100)
+  predictions_df[[col_name]] <- as.factor(ifelse(predictions_df$pred_irregularity > threshold, 1, 0))
+}
+
+# Function to manually calculate sensitivity and specificity
+calculate_metrics <- function(true_labels, predicted_labels) {
+  cm <- table(True = true_labels, Predicted = predicted_labels)
+  TP <- cm[2, 2]
+  FN <- cm[2, 1]
+  TN <- cm[1, 1]
+  FP <- cm[1, 2]
+  
+  sensitivity <- TP / (TP + FN)
+  specificity <- TN / (TN + FP)
+  
+  return(c(sensitivity = sensitivity, specificity = specificity))
+}
+
+# Calculate metrics for each threshold
+metrics_list <- lapply(thresholds, function(threshold) {
+  col_name <- paste0("pred_stat", threshold * 100)
+  calculate_metrics(predictions_df$irregularity, predictions_df[[col_name]])
+})
+
+# Create a dataframe with the results
+metrics_df <- do.call(rbind, metrics_list)
+metrics_df <- data.frame(Threshold = thresholds * 100, metrics_df)
+metrics_df <- metrics_df %>%
+  mutate(sensitivity = round(sensitivity, 3),
+         specificity = round(specificity, 3))
+
+# Plot the dataframe
+metrics_df %>%
+  pivot_longer(cols = -Threshold, names_to = "Measure", values_to = "Value") %>%
+  ggplot(aes(x = Threshold, y = Value, color = Measure)) +
+  geom_line() +
+  geom_point() +
+  theme_bw() +
+  scale_color_manual(values = c("sensitivity" = "blue", "specificity" = "red"),
+                     labels = c("Sensitivity", "Specificity"),
+                     name = "Measure") +
+  labs(x = "Threshold (%)",
+       y = "Value") +
+  scale_x_continuous(breaks = seq(50, 90, by = 5))
+```
+
+### Building the model
+```{r}
+# Normalizing weights
+dc_training_assessment <- dc_training_assessment %>% 
+  mutate(weight_ln = log(weight)) %>%
+  mutate(weight = weight_ln / sum(weight_ln)) %>%
+  select(-weight_ln)
+
+
+# Regular
+rf_model <- ranger(
+    formula = irregularity ~ .,  # Assuming 'irregularity' is the target variable
+    data = dplyr::select(dc_training_assessment, -weight),
+    case.weights = dc_training_assessment$weight,
+    num.trees = 500,
+    mtry = 9,
+    importance = 'permutation',
+    probability = TRUE  # if you need probability estimates
+)
+```
+
+### Predicting on testing data
+```{r}
+test_predictions <- predict(rf_model, dc_testing_filt)
+
+```
+
+
+```{r}
+predictions_test <- data.frame('irregularity' = as.factor(dc_testing_filt$irregularity),
+                           'pred_irregularity' = test_predictions$predictions[,2])
+
+predictions_test <- predictions_test %>%
+  mutate(hard = as.factor(ifelse(pred_irregularity > .60, 1, 0))) %>%
+  mutate(cost = ifelse(irregularity == 1 & hard == 0, "FN",
+                              ifelse(irregularity == 0 & hard == 1, "FP",
+                                     0)))
+
+
+
+# Costs
+FN_C <- predictions_test %>% filter(cost == "FN") %>% pull() %>% length() * 122
+FP_C <- predictions_test %>% filter(cost == "FP") %>% pull() %>% length() * 1
+
+
+# Calculating metrics
+metrics <- calculate_metrics(predictions_test$irregularity, predictions_test$hard)
+
+
+
+# TPR (Sensitivity)
+tpr <- round(metrics[[1]], 2)
+
+# FPR (1 - Specificity)
+fpr <- round(metrics[[2]], 2)
+
+# Total cost
+tc <- FN_C + FP_C
+
+# Scaled TPR
+s_tpr <- round(tpr / (tc/nrow(predictions_test)), 2)
+
+# Scaled FPR
+s_fpr <- round(fpr / (tc/nrow(predictions_test)), 2)
+
+# Average cost
+ac <- round(tc / nrow(predictions_test), 2)
+
+# Correlation
+cor <- cor(dc_testing_filt$FEES_AT, predictions_test$pred_irregularity)
+
+# Setting up the dataframe
+final_comparison_metrics_rf_DCS<- data.frame("RF_DCS" = c(tpr, fpr, tc, ac, s_tpr, s_fpr, cor))
+
+# Binding to comparison df
+comparison_df <- cbind(comparison_df, final_comparison_metrics_rf_DCS)
+```
+
+### Feature importance scores
+```{r}
+# Extract feature importance
+importance_scores <- rf_model$variable.importance
+importance_df <- data.frame(
+  Feature = names(importance_scores),
+  Importance = importance_scores) %>%
+  arrange(desc(Importance)) %>%
+  filter(Feature != "weight")
+
+hist <- ggplot(importance_df, aes(x = Importance)) +
+  geom_density() +
+  labs(title = "") +
+  theme_classic() +
+  theme(text = element_text(family = "Times New Roman", size = 16))
+
+ggsave(file = "plots/vip_rf_dcs_dens.png", plot = hist, width = 6, height = 3)
+
+importance_df_head <- importance_df %>% head(6)
+
+# Plot feature importance
+vip_rf_dcs <- ggplot(importance_df_head, aes(x = reorder(Feature, Importance), y = Importance)) +
+  geom_point() +
+  coord_flip() +
+  labs(title = "",
+       x = "") +
+  theme_classic() +
+  theme(text = element_text(family = "Times New Roman", size = 16))
+
+ggsave(file = "plots/vip_rf_dcs.png", plot = vip_rf_dcs, width = 6, height = 3)
+
+```
+
+### PDP
+```{r}
+selected_features <- c("RES_ADVERSE", "rect_act", "rect_turn", "RES_IMPROVES", "cash_ratio", "at_turn")
+data_for_explainer <- dplyr::select(dc_training_assessment, -irregularity)
+# Create an explainer object using DALEX
+explainer_rf <- explain(
+  model = rf_model,
+  data = data_for_explainer,
+  y = df.analysis_train_assess$irregularity,
+  label = "Random Forest"
+)
+
+# Generate Partial Dependence Plots for selected features
+pdp_rf <- model_profile(
+  explainer = explainer_rf,
+  variables = selected_features
+)
+
+pdp_rf_dcs_reg <- plot_single_partial_dependence_ggplot(pdp_rf)
+
+ggsave(file = "plots/pdp_rf_dcs_reg.png", plot = pdp_rf_dcs_reg, width = 8, height = 4)
+
+```
+
+### ROC AUC
+```{r}
+roc <-  roc_curve(predictions_test, truth = irregularity, pred_irregularity) %>% autoplot()
+  
+
+ggsave(file = "plots/roc_rf_dcs.png", plot = roc, width = 4, height = 4)
+
+roc_auc(predictions_test, irregularity, pred_irregularity)
+```
+
+## SMOTE model building
+```{r}
+# Normalizing weights
+dc_training_smote <- dc_training_smote %>% 
+  mutate(weight_ln = log(weight)) %>%
+  mutate(weight = weight_ln / sum(weight_ln)) %>%
+  select(-weight_ln) 
+  
+
+# Regular
+rf_model <- ranger(
+    formula = irregularity_smote ~ .,  # Assuming 'irregularity' is the target variable
+    data = dplyr::select(dc_training_smote, -weight),
+    case.weights = dc_training_smote$weight,
+    num.trees = 500,
+    mtry = 9,
+    importance = 'permutation',
+    probability = TRUE  # if you need probability estimates
+)
+
+```
+### Predicting on testing data
+```{r}
+test_predictions <- predict(rf_model, dc_assess_smote)
+```
+
+### Setting threshold
+I set the threshold to 50%. This threshold gives me the best specificity and sensitivity.
+```{r}
+predictions_df <- data.frame('irregularity' = as.factor(dc_assess_smote$irregularity_smote),
+                           'pred_irregularity' = test_predictions$predictions[,2])
+
+# Create predictions at various thresholds
+thresholds <- c(0.2, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.7, 0.8, 0.9)
+for (threshold in thresholds) {
+  col_name <- paste0("pred_stat", threshold * 100)
+  predictions_df[[col_name]] <- as.factor(ifelse(predictions_df$pred_irregularity > threshold, 1, 0))
+}
+
+# Function to manually calculate sensitivity and specificity
+calculate_metrics <- function(true_labels, predicted_labels) {
+  cm <- table(True = true_labels, Predicted = predicted_labels)
+  TP <- cm[2, 2]
+  FN <- cm[2, 1]
+  TN <- cm[1, 1]
+  FP <- cm[1, 2]
+  
+  sensitivity <- TP / (TP + FN)
+  specificity <- TN / (TN + FP)
+  
+  return(c(sensitivity = sensitivity, specificity = specificity))
+}
+
+# Calculate metrics for each threshold
+metrics_list <- lapply(thresholds, function(threshold) {
+  col_name <- paste0("pred_stat", threshold * 100)
+  calculate_metrics(predictions_df$irregularity, predictions_df[[col_name]])
+})
+
+# Create a dataframe with the results
+metrics_df <- do.call(rbind, metrics_list)
+metrics_df <- data.frame(Threshold = thresholds * 100, metrics_df)
+metrics_df <- metrics_df %>%
+  mutate(sensitivity = round(sensitivity, 3),
+         specificity = round(specificity, 3))
+
+# Plot the dataframe
+metrics_df %>%
+  pivot_longer(cols = -Threshold, names_to = "Measure", values_to = "Value") %>%
+  ggplot(aes(x = Threshold, y = Value, color = Measure)) +
+  geom_line() +
+  geom_point() +
+  theme_bw() +
+  scale_color_manual(values = c("sensitivity" = "blue", "specificity" = "red"),
+                     labels = c("Sensitivity", "Specificity"),
+                     name = "Measure") +
+  labs(x = "Threshold (%)",
+       y = "Value") +
+  scale_x_continuous(breaks = seq(20, 90, by = 5))
+```
+
+### Building the model
+```{r}
+# Normalizing weights
+dc_training_assessment_smote <- dc_training_assessment_smote %>% 
+  mutate(weight_ln = log(weight)) %>%
+  mutate(weight = weight_ln / sum(weight_ln)) %>%
+  select(-weight_ln)
+
+
+# Regular
+rf_model <- ranger(
+    formula = irregularity_smote ~ .,  # Assuming 'irregularity' is the target variable
+    data = dplyr::select(dc_training_assessment_smote, -weight),
+    case.weights = dc_training_assessment_smote$weight,
+    num.trees = 500,
+    mtry = 9,
+    importance = 'permutation',
+    probability = TRUE  # if you need probability estimates
+)
+```
+
+### Predicting on testing data
+```{r}
+test_predictions <- predict(rf_model, dc_testing_smote_filt)
+
+```
+
+
+```{r}
+predictions_test <- data.frame('irregularity' = as.factor(dc_testing_smote_filt$irregularity_smote),
+                           'pred_irregularity' = test_predictions$predictions[,2])
+
+predictions_test <- predictions_test %>%
+  mutate(hard = as.factor(ifelse(pred_irregularity > .50, 1, 0))) %>%
+  mutate(cost = ifelse(irregularity == 1 & hard == 0, "FN",
+                              ifelse(irregularity == 0 & hard == 1, "FP",
+                                     0)))
+
+
+
+# Costs
+FN_C <- predictions_test %>% filter(cost == "FN") %>% pull() %>% length() * 122
+FP_C <- predictions_test %>% filter(cost == "FP") %>% pull() %>% length() * 1
+
+
+# Calculating metrics
+metrics <- calculate_metrics(predictions_test$irregularity, predictions_test$hard)
+
+
+
+# TPR (Sensitivity)
+tpr <- round(metrics[[1]], 2)
+
+# FPR (1 - Specificity)
+fpr <- round(metrics[[2]], 2)
+
+# Total cost
+tc <- FN_C + FP_C
+
+# Scaled TPR
+s_tpr <- round(tpr / (tc/nrow(predictions_test)), 2)
+
+# Scaled FPR
+s_fpr <- round(fpr / (tc/nrow(predictions_test)), 2)
+
+# Average cost
+ac <- round(tc / nrow(predictions_test), 2)
+
+# Correlation
+cor <- cor(dc_testing_smote_filt$FEES_AT, predictions_test$pred_irregularity)
+
+# Setting up the dataframe
+final_comparison_metrics_rf_DCS_SMOTE<- data.frame("RF_DCS_SMOTE" = c(tpr, fpr, tc, ac, s_tpr, s_fpr, cor))
+
+# Binding to comparison df
+comparison_df <- cbind(comparison_df, final_comparison_metrics_rf_DCS_SMOTE)
+```
+
+
+### LM
+```{r}
+data_lm <- data.frame("fees" = dc_testing_smote$AUDIT_FEES*1000000,
+                      "size" = (dc_testing_smote$AUDIT_FEES*1000000 / dc_testing_smote$FEES_AT),
+                      "lev" = dc_testing_smote$lvgi,
+                      "pred" = predictions_test$pred_irregularity)
+
+dcs_smote_lm <- lm(log(fees) ~ pred + size + lev, data = data_lm)
+```
+
+
+
+
+### Feature importance scores
+```{r}
+# Extract feature importance
+importance_scores <- rf_model$variable.importance
+importance_df <- data.frame(
+  Feature = names(importance_scores),
+  Importance = importance_scores) %>%
+  arrange(desc(Importance)) %>%
+  filter(Feature != "weight")
+
+hist <- ggplot(importance_df, aes(x = Importance)) +
+  geom_density() +
+  labs(title = "") +
+  theme_classic() +
+  theme(text = element_text(family = "Times New Roman", size = 16))
+
+ggsave(file = "plots/vip_rf_dcs_dens_smote.png", plot = hist, width = 6, height = 3)
+
+importance_df_head <- importance_df %>% head(6)
+
+# Plot feature importance
+vip_rf_dcs <- ggplot(importance_df_head, aes(x = reorder(Feature, Importance), y = Importance)) +
+  geom_point() +
+  coord_flip() +
+  labs(title = "",
+       x = "") +
+  theme_classic() +
+  theme(text = element_text(family = "Times New Roman", size = 16))
+
+ggsave(file = "plots/vip_rf_dcs_smote.png", plot = vip_rf_dcs, width = 6, height = 3)
+
+```
+
+### PDP
+```{r}
+selected_features <- c("AUDITOR_RESIGN", "manuf_company", "rd_sale", "RES_ADVERSE", "RES_IMPROVES", "ceo_chair")
+data_for_explainer <- dplyr::select(dc_training_assessment_smote, -irregularity_smote)
+# Create an explainer object using DALEX
+explainer_rf <- explain(
+  model = rf_model,
+  data = data_for_explainer,
+  y = df.analysis_train_assess_smote$irregularity_smote,
+  label = "Random Forest"
+)
+
+# Generate Partial Dependence Plots for selected features
+pdp_rf <- model_profile(
+  explainer = explainer_rf,
+  variables = selected_features
+)
+
+pdp_rf_dcs_smote <- plot_single_partial_dependence_ggplot(pdp_rf)
+
+ggsave(file = "plots/pdp_rf_dcs_smote.png", plot = pdp_rf_dcs_smote, width = 8, height = 4)
+
+```
+
+### ROC AUC
+```{r}
+roc <-  roc_curve(predictions_test, truth = irregularity, pred_irregularity) %>% autoplot()
+
+ggsave(file = "plots/roc_rf_dcs_smote.png", plot = roc, width = 4, height = 4)
+
+roc_auc(predictions_test, irregularity, pred_irregularity)
+```
+
+
+```{r}
+head(comparison_df,10)
+```
+
+# Table
+```{r}
+stargazer(reg_lm, scs_lm, dcs_smote_lm)
+```
+
+
+
+
+
+
+
+
+
+
