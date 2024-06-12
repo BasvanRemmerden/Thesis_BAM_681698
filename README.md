@@ -1,4 +1,4 @@
-This repository holds all code used in the creation of my thesis titled: "Developing a Cost-Sensitive Machine Learning Model to Detect Fraud in Financial Restatements: An Auditor-Centric Approach."
+This repository holds all code used in the creation of my thesis titled: "Assessing the Benefits of Using Cost-Sensitive Machine Learning Methods in Fraud Detection: An Auditor-Centric Approach."
 Additionally, the cleaned datasets are added to allow for recreation of the results.
 
 The data is retrieved from WRDS, and direct links to the specific databases can be found in the references of the thesis.
