@@ -1,0 +1,217 @@
+---
+title: "Exploratory Analysis"
+author: "Bas van Remmerden"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+
+# Set up
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Setting seed
+```{r}
+set.seed(123)
+```
+
+## Loading libraries
+Loading the required libraries
+```{r warning = F, message = F}
+#### Installing/loading packages
+required_packages <- c(
+  "tidyverse",
+  "lubridate",
+  "tidymodels",
+  "beepr",
+  "stargazer",
+  "extrafont",
+  "gridExtra",
+  "corrplot"
+)
+
+# install.packages(packages_to_install)
+for (pkg in required_packages) {
+  require(pkg, character.only = TRUE)
+}
+
+# Cleaning the environment before analysis
+rm(pkg, required_packages)
+
+# Loading more fonts
+#font_import()
+loadfonts(device = "win")
+```
+
+# Loading the data
+```{r}
+load("data/details.RData")
+load("data/analysis.RData")
+load("data/analysis_smote.RData")
+load("data/details_long.RData")
+```
+
+# Restatement type
+```{r}
+df.res_inf <- df.details %>%
+  # Remove the leading and trailing |
+  mutate(values = substring(RES_ACCOUNTING_RES_CAT_FKE_LIS, 2, nchar(RES_ACCOUNTING_RES_CAT_FKE_LIS) - 1),
+         content = substring(RES_ACCOUNTING_RES_CAT_TIT_LIS, 2, nchar(RES_ACCOUNTING_RES_CAT_TIT_LIS) - 1)) %>%
+  # Separate the rows based on the |
+  separate_rows(values, content, sep = "\\|", convert = TRUE) %>%
+  select(FILE_DATE,
+         RESTATEMENT_NOTIFICATION_KEY,
+         RES_BEGIN_AUDITOR_NAME,
+         RES_END_AUDITOR_NAME,
+         values,
+         content,
+         irregularity,
+         RES_FRAUD) %>%
+  drop_na()
+
+restatement_information <- df.res_inf %>%
+  group_by(content, irregularity) %>%
+  summarize(count = n(),
+            percentage = round(count / nrow(df.res_inf %>% filter(irregularity == 1)) * 100, 2)) %>%
+  filter(irregularity == 1) %>%
+  arrange(desc(count)) %>%
+  select(content, percentage) %>%
+  head(10) %>%
+  ungroup()
+
+stargazer(restatement_information, summary = F)
+```
+
+# Auditor
+```{r}
+df.analysis %>%
+  mutate(`Audit fee` = as.numeric(AUDIT_FEES),
+         `Big 4` = as.numeric(AUDITOR_BIG4),
+         `Irregularity` = as.numeric(irregularity),
+         `Resigned` = as.numeric(AUDITOR_RESIGN)) %>%
+  select(`Irregularity`,
+         `Audit fee`,
+         `Big 4`,
+         `Resigned`) %>%
+  cor() %>%
+  round(digits = 2) %>%
+  stargazer()
+```
+
+# Restatement years
+```{r}
+rest_years <- df.details_long %>%
+  filter(year > 1999) %>%
+  group_by(year, irregularity) %>%
+  summarise(total_count = n()) %>%
+  arrange(year) %>%
+  ggplot() +
+  geom_line(aes(x = year, y = total_count, color = factor(irregularity))) +
+  scale_x_continuous(breaks = seq(2000, 2023, by = 1)) +
+  scale_y_continuous() +
+  scale_color_manual(values = c("0" = "black", "1" = "red"),
+                     labels = c("Normal", "Irregularity")) +
+  labs(y = "Count", color = "Restatement") +
+  theme_classic() +
+  theme(
+    text = element_text(family = "Times New Roman", size = 14),
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)
+  )
+
+ggsave(plot = rest_years, file = "plots/rest_years.png", height = 4, width = 8)
+
+rm(main_df, irregularity_df, rest_years)
+
+cor(df.details_long$irregularity, df.details_long$year)
+```
+## Covid analysis
+```{r}
+
+restatement_information_cov <- df.res_inf %>%
+  mutate(year = year(dmy(FILE_DATE))) %>%
+  filter(year %in% c(2019, 2020, 2021)) %>%
+  group_by(content, irregularity) %>%
+  summarize(count = n(), .groups = 'drop') %>%
+  filter(irregularity == 0) %>%
+  mutate(percentage = round((count / sum(count)) * 100, 2)) %>%
+  arrange(desc(count)) %>%
+  select(content, percentage) %>%
+  ungroup() %>%
+  head(3)
+
+stargazer(restatement_information_cov, summary = F)
+```
+# Data composition plot
+```{r}
+# Plot both lines on the same graph
+data_comp <- df.analysis %>%
+  group_by(year, irregularity) %>%
+  summarise(total_count = n()) %>%
+  arrange(year) %>%
+  ggplot() +
+  geom_line(aes(x = year, y = total_count, color = factor(irregularity))) +
+  scale_x_continuous(breaks = seq(min(df.analysis$year), max(df.analysis$year), by = 1)) +
+  scale_y_continuous() +
+  scale_color_manual(values = c("2" = "blue", "0" = "black", "1" = "red"),
+                     labels = c("No restatement", "Restatement (Normal)", "Restatement (Irregularity)")) +
+  labs(y = "Count", color = "Observation type") +
+  theme_classic() +
+  theme(
+    text = element_text(family = "Times New Roman", size = 14),
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)
+  )
+
+
+ggsave(plot = data_comp, file = "plots/data_comp.png", height = 4, width = 8)
+rm(main_df, irregularity_df)
+```
+# Class imbalance voor en na SMOTE
+```{r}
+# Normal
+df.analysis %>%
+  filter(irregularity != 2) %>%
+  group_by(irregularity) %>%
+  summarize(count = n())
+
+# SMOTE
+df.analysis_smote %>%
+  filter(irregularity != 2) %>%
+  group_by(irregularity_smote) %>%
+  summarize(count = n())
+
+
+smote_1 <- df.analysis %>%
+  filter(irregularity != 2) %>%
+  group_by(irregularity) %>%
+  summarize(count = n()) %>%
+  ggplot(aes(x = factor(irregularity, labels =  c("Normal", "Irregularity")), y = count)) +
+  geom_col() +
+  labs(x = "",
+       y = "Count",
+       title = "Before SMOTE") + 
+  theme_classic() +
+    theme(
+    text = element_text(family = "Times New Roman", size = 14)
+  )
+  
+smote_2 <- df.analysis_smote %>%
+  filter(irregularity != 2) %>%
+  group_by(irregularity_smote) %>%
+  summarize(count = n()) %>%
+  ggplot(aes(x = factor(irregularity_smote, labels =  c("Normal", "Irregularity")), y = count)) +
+  geom_col() +
+  labs(x = "",
+       y = "Count",
+       title = "After SMOTE") + 
+  theme_classic() +
+    theme(
+    text = element_text(family = "Times New Roman", size = 14)
+  )
+
+grid.arrange(smote_1, smote_2, nrow = 1)
+ggsave("plots/class_imbalance.png", plot = arrangeGrob(smote_1, smote_2, nrow = 1), width = 10, height = 5)
+
+```
+
+

@@ -1,0 +1,646 @@
+---
+title: "Data prep"
+author: "Bas van Remmerden"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+
+# Set up
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+set.seed(123)
+```
+
+
+## Loading libraries
+Loading the required libraries
+```{r warning = F, message = F}
+#### Installing/loading packages
+required_packages <- c(
+  "tidyverse",
+  "lubridate",
+  "tidymodels",
+  "beepr",
+  "DescTools",
+  "smotefamily"
+)
+
+# install.packages(packages_to_install)
+for (pkg in required_packages) {
+  require(pkg, character.only = TRUE)
+}
+
+# Cleaning the environment before analysis
+rm(pkg, required_packages)
+```
+
+## Loading linking table
+```{r}
+linking_table <- read.csv("Original datasets/linking_table_cik_gvkey.csv") %>%
+  select(cik, gvkey) %>%
+  unique()
+```
+
+
+# Compustat data
+## Loading the data
+```{r}
+df.compustat <- read.csv("Original datasets/financial_information.csv")
+```
+
+## Preparation
+### Creating year variable
+```{r}
+df.compustat <- df.compustat %>%
+  mutate(year = fyear,
+         .after = gvkey)
+```
+
+### Dealing with NA values
+```{r}
+# Variables in the data that I will use
+         #rect, # Total receivables 2
+         #recd, # Doubtful receivables VEEL NA
+         #sale, # Sales 12
+         #cshi, # Shares issued
+         #csho, # Common shares outstanding
+         #oancf, # operating cashflow
+         #gp, # gross profit or nisa
+         #intan, # Intangible assets, total
+         #invt, # Inventory, total
+         #act, # Current assets, total
+         #at, # assets, total 6
+         #cogs, # cost of goods sold 41
+         #dd1, # Long term debt due in one year 9
+         #lct, # Current liabilities, total 5
+         #ppent, # plant property equipment 8
+         #xsga, # SGA 198
+         #txp, # income taxes payable 71
+         #dp, # Depreciation 14
+         #am # Amortization 65
+
+set_to_0 <- c("rect",
+              "recd",
+              "sale",
+              "cshi",
+              "csho",
+              "oancf",
+              "gp",
+              "intan",
+              "invt",
+              "cogs",
+              "dd1",
+              "lct",
+              "ppent",
+              "xsga",
+              "txp",
+              "dp",
+              "am"
+              )
+
+df.compustat <- df.compustat %>%
+  mutate_at(vars(one_of(set_to_0)), ~replace_na(., 0))
+```
+
+
+### Creating the variables for my model
+```{r}
+df.compustat <- df.compustat %>%
+  mutate(
+    # DSRI
+    dsri = (rect/sale)/(lag(rect) / lag(sale)),
+    
+    # GMI   
+    gmi = ((lag(sale)-lag(cogs)) / lag(sale))/((sale/cogs)/sale),
+    
+    # AQI
+    aqi = ((1-act+ppent)/at) / ((1-lag(act)+lag(ppent))/lag(at)),
+    
+    # SGI     
+    sgi = sale / lag(sale),
+    
+    # DEPI
+    depi = (lag(dp)/(lag(dp)+lag(ppent))) / (dp/(dp+ppent)),
+    
+    # SGAI
+    sgai = (xsga / sale) / (lag(xsga)/lag(sale)),
+    
+    # LVGI
+    lvgi = ((dd1+lct)/at) / ((lag(dd1)+lag(lct))/lag(at)),
+    
+    # new_sh_issued
+    new_sh_issued = if_else((csho - lag(csho, default = first(csho)) > 0) | cshi > 0, 1, 0),
+    
+    # int_assets
+    int_assets = intan / at,
+    
+    # inv_method
+    #inv_method = , ###############
+    
+    # inv_growth
+    inv_growth = invt / lag(invt),
+    
+    # manuf_company
+    manuf_company =if_else(sic > 2999 & sic < 4000, 1, 0), 
+    
+    # cf_earn_corr
+    #cf_earn_corr = cor(gp, oancf), ######## 
+    
+    # cf_earn_smooth
+    #cf_earn_smooth = , ########
+    
+    # afda_rec
+    afda_rec = recd / rect,
+    
+    # afda_sales
+    afda_sales = recd / sale,
+    
+    # rec_sales
+    rec_sales = rect / sale,
+    
+    # inv_sales
+    inv_sales = invt / sale
+    ) 
+
+df.compustat <- df.compustat %>%
+  mutate(
+    dsri = ifelse(is.na(dsri), 1, dsri),
+    gmi = ifelse(is.na(gmi), 1, gmi),
+    aqi = ifelse(is.na(aqi), 1, aqi),
+    sgi = ifelse(is.na(sgi), 1, sgi),
+    depi = ifelse(is.na(depi), 1, depi),
+    sgai = ifelse(is.na(sgai), 1, sgai),
+    lvgi = ifelse(is.na(lvgi), 1, lvgi),
+  )
+
+
+```
+
+### Selecting relevant variables
+```{r}
+df.compustat_filt <- df.compustat %>%
+  select(gvkey,
+         year,
+         sic,
+         dsri,
+         gmi, 
+         aqi,
+         sgi,
+         depi,
+         sgai,
+         lvgi,
+         new_sh_issued,
+         #inv_method,
+         inv_growth,
+         manuf_company,
+         #cf_earn_corr,
+         #cf_earn_smooth,
+         afda_rec,
+         afda_sales,
+         rec_sales,
+         inv_sales,
+         at
+         
+         #rect, # Total receivables 2
+         #recd, # Doubtful receivables VEEL NA
+         #sale, # Sales 12
+         #cshi, # Shares issued
+         #csho, # Common shares outstanding
+         #oancf, # operating cashflow
+         #gp, # gross profit or nisa
+         #intan, # Intangible assets, total
+         #invt, # Inventory, total
+         #act, # Current assets, total
+         #at, # assets, total 6
+         #cogs, # cost of goods sold 41
+         #dd1, # Long term debt due in one year 9
+         #lct, # Current liabilities, total 5
+         #ppent, # plant property equipment 8
+         #xsga, # SGA 198
+         #txp, # income taxes payable 71
+         #dp, # Depreciation 14
+         #am # Amortization 65
+         )
+```
+
+### Dropping NA values
+```{r}
+df.compustat <- df.compustat_filt %>%
+  drop_na()
+```
+
+### Removing unnecessary objects from my environment
+```{r}
+rm(df.compustat_filt, set_to_0)
+```
+
+### Creating analysis data
+```{r}
+df.analysis <- df.compustat
+```
+
+# Audit fees data
+## Loading the data
+```{r}
+df.audit <- read.csv("Original datasets/audit_fees.csv")
+```
+
+## Preparation
+### Adding a year denotation
+```{r}
+df.audit <- df.audit %>%
+  mutate(year = year(dmy(FILE_DATE)))
+```
+
+### Selecting only necessary variables
+```{r}
+df.audit <- df.audit %>%
+  select(year,
+         COMPANY_KEY,
+         AUDIT_FEES,
+         AUDITOR_FKEY
+         ) %>%
+  arrange(COMPANY_KEY)
+```
+
+### Adding gvkey
+```{r}
+# Renaming id column in audit data
+df.audit <- df.audit %>%
+  rename(cik = COMPANY_KEY)
+
+# Linking gvkey to audit
+df.audit <- left_join(df.audit, linking_table, by = c("cik"), 
+                     relationship = "many-to-many")
+```
+
+### Creating big4 indicator
+```{r}
+df.audit <- df.audit %>%
+  mutate(AUDITOR_BIG4 = ifelse(AUDITOR_FKEY %in% c(1, 2, 3, 4), 1, 0))
+```
+
+
+### Linking to analysis data
+```{r}
+df.analysis <- left_join(df.analysis, df.audit, by = c("gvkey", "year"))  %>%
+  select(-cik)
+```
+
+### Scaling audit fees
+```{r}
+df.analysis <- df.analysis %>%
+  mutate(FEES_AT = AUDIT_FEES / at) %>%
+  select(-at)
+```
+
+
+# Auditor change data
+## Preparation
+### Loading the data
+```{r}
+df.audit_change <- read.csv("Original datasets/audit_change.csv")
+```
+
+### Adding a year denotation
+```{r}
+df.audit_change <- df.audit_change %>%
+  mutate(year = year(dmy(DISMISS_DATE)))
+```
+
+### Selecting only necessary variables
+```{r}
+df.audit_change <- df.audit_change %>%
+  select(year,
+         COMPANY_FKEY,
+         AUDITOR_RESIGNED
+         )
+```
+
+### Adding gvkey
+```{r}
+# Renaming id column in audit data
+df.audit_change <- df.audit_change %>%
+  rename(cik = COMPANY_FKEY)
+
+# Linking gvkey to audit
+df.audit_change <- left_join(df.audit_change, linking_table, by = c("cik"), 
+                     relationship = "many-to-many")
+```
+
+### Linking to analysis data
+```{r}
+df.analysis <- left_join(df.analysis, df.audit_change, by = c("gvkey", "year"),
+                         relationship = "many-to-many") %>%
+  select(-cik)
+```
+
+### Replacing NA with 0
+```{r}
+df.analysis <- df.analysis %>%
+  mutate(AUDITOR_RESIGNED = ifelse(is.na(AUDITOR_RESIGNED), 0, AUDITOR_RESIGNED))
+```
+
+
+
+# Governance data
+## Loading the data
+```{r}
+df.ceo <- read.csv("Original datasets/ceo_data.csv")
+```
+
+## Preparation
+### Adding gvkey
+```{r}
+# Renaming id column in ceo data
+df.ceo <- df.ceo %>%
+  rename(cik = COMPANY_KEY)
+
+# Linking gvkey to audit
+df.ceo <- left_join(df.ceo, linking_table, by = c("cik"), 
+                     relationship = "many-to-many")
+```
+
+
+### Creating variables
+```{r}
+# Adding year variable
+df.ceo <- df.ceo %>%
+  mutate(year = year(dmy(EFF_DATE)))
+
+# Adding variable denoting whether the CEO is also the chairman
+df.ceo <- df.ceo %>%
+  mutate(ceo_chair = ifelse(IS_CHAIR + IS_CEO == 1, 1, 0))
+
+```
+### Selecting relevant variables
+```{r}
+# Taking unique values to remove duplicates when there are two changes
+df.ceo = df.ceo %>%
+  filter(ceo_chair == 1) %>%
+  select(gvkey, cik, year, ceo_chair) %>%
+  unique()
+```
+
+### Linking to Analysis data
+```{r}
+df.analysis <- left_join(df.analysis, df.ceo, by = c("gvkey", "year")) %>%
+  select(-cik)
+```
+
+### Replacing NA with 0
+```{r}
+df.analysis <- df.analysis %>%
+  mutate(ceo_chair = ifelse(is.na(ceo_chair), 0, ceo_chair))
+```
+
+
+# Financial restatements data
+## Preparation
+### Loading the data
+```{r}
+df.rest <- read.csv('Original datasets/financial_restatements.csv')
+```
+
+### Setting date variable
+Setting the correct format dates
+```{r}
+df.rest <- df.rest %>%
+  mutate(RES_BEGIN_DATE = dmy(RES_BEGIN_DATE),
+         RES_END_DATE = dmy(RES_END_DATE)) %>%
+  filter(!is.na(RES_BEGIN_DATE) & !is.na(RES_END_DATE))
+```
+
+### Adding dependent variable
+I follow Karpoff's approach to labeling restatements as irregularities
+```{r}
+df.rest <- df.rest %>%
+  mutate(irregularity = if_else(RES_FRAUD == 1 | 
+                                  RES_SEC_INVESTIGATION == 1 | 
+                                  (RES_ACCOUNTING == 0 & RES_CLERICAL_ERRORS == 0),
+                                1, 0)) 
+```
+
+### Adding gvkey
+```{r}
+# Adding the gvkey through a linking table
+df.rest <- df.rest %>%
+  mutate(cik = COMPANY_FKEY,
+         .before = RESTATEMENT_NOTIFICATION_KEY) %>%
+  select(-COMPANY_FKEY,
+         -COMPANY_KEY)
+
+# Linking the gvkey to cik
+df.rest <- left_join(df.rest, linking_table, by = c("cik"), 
+                     relationship = "many-to-many")
+
+
+```
+
+### Creating a variable denoting auditor change and resignation
+```{r}
+df.rest <- df.rest %>%
+  mutate(AUDITOR_RESIGNED_RES = ifelse(RES_END_AUDITOR_FKEY == CURR_AUD_FKEY, 0, 1))
+```
+
+### Changing to long format
+By doing this, I can make sure that each year has one observation.
+```{r}
+df.rest_long <- df.rest %>%
+  rowwise() %>%
+  do({
+    num_years <- year(.$RES_END_DATE) - year(.$RES_BEGIN_DATE) + 1
+    data.frame(., year = seq(year(.$RES_BEGIN_DATE), by = 1, length.out = num_years))
+  }) %>%
+  ungroup()
+```
+
+### Saving a copy as the details dataset
+```{r}
+df.details <- df.rest
+df.details_long <- df.rest_long
+
+save(file = "Prepared datasets/details.RData", df.details)
+save(file = "Prepared datasets/details_long.RDATA", df.details_long)
+```
+
+### Saving relevant variables for analysis data
+```{r}
+df.rest <- df.rest_long %>%
+  select(gvkey,
+         year,
+         irregularity,
+         RES_ADVERSE,
+         RES_IMPROVES,
+         AUDITOR_RESIGNED_RES
+         )
+
+rm(df.rest_long)
+```
+
+### Linking to the Analysis data
+```{r}
+df.analysis <- left_join(df.analysis, df.rest, by = c("gvkey", "year"))
+```
+
+### Dealing with NA values
+```{r}
+df.analysis <- df.analysis %>%
+  mutate(RES_ADVERSE = ifelse(is.na(RES_ADVERSE), 2, RES_ADVERSE),
+         RES_IMPROVES = ifelse(is.na(RES_IMPROVES), 2, RES_IMPROVES),
+         irregularity = ifelse(is.na(irregularity), 2, irregularity),
+         
+         AUDITOR_RESIGN = ifelse(!is.na(AUDITOR_RESIGNED) & AUDITOR_RESIGNED == 1 | !is.na(AUDITOR_RESIGNED_RES) & AUDITOR_RESIGNED_RES == 1, 1, 0)) %>%
+  select(-AUDITOR_RESIGNED,
+         -AUDITOR_RESIGNED_RES)
+```
+
+
+
+# Financial ratios data (v12-05)
+## Loading the data
+```{r}
+df.ratios <- read.csv("Original datasets/financial_ratios.csv") 
+
+```
+
+## Preparation
+### Filtering the data
+I only want to keep financial ratios for the companies in my restatements data
+```{r}
+# Obtaining gvkeys from analysis data
+company_codes <- unique(df.analysis$gvkey)
+
+# keeping the gvkeys needed
+df.ratios <- df.ratios %>%
+  filter(gvkey %in% company_codes)
+```
+
+### Adding year variable
+```{r}
+df.ratios <- df.ratios %>%
+  mutate(year = ifelse(adate == "", year(dmy(qdate)), year(dmy(adate))),
+         .after = "adate")
+```
+
+### Changing divyield variable
+```{r}
+df.ratios <- df.ratios %>%
+  mutate(divyield = as.numeric(sub("%", "", divyield))/100,
+         year = as.integer(year))
+```
+
+### Selecting correct variables
+```{r}
+df.ratios_filt <- df.ratios %>%
+  select(gvkey,
+         year, 
+         
+         # Main financial ratios
+         accrual,
+         de_ratio,
+         bm,
+         at_turn,
+         npm,
+         rect_act,
+         
+         # Supplementary financial ratios
+         inv_turn,
+         pay_turn,
+         rect_turn,
+         invt_act,
+         fcf_ocf,
+         ocf_lct,
+         cash_conversion,
+         cash_ratio,
+         curr_ratio,
+         quick_ratio,
+         rd_sale,
+         GProf,
+         roa,
+         roce,
+         roe,
+         debt_assets,
+         pcf,
+         pe_inc,
+         ps)
+```
+
+### Aggregating the data
+I have to aggregate the data to obtain yearly ratios instead of monthly ratios. I save the file so that I do not have to run these computations every time.
+```{r}
+#df.ratios_aggregated <- df.ratios_filt %>%
+#  group_by(gvkey, year) %>%
+#  summarize(across(where(is.numeric), mean, na.rm = TRUE) , .groups = "keep") 
+#  (across(where(is.numeric), ~mean(.x, na.rm = TRUE)), .groups = 'drop')
+#beepr::beep(sound = 2)
+```
+
+### Saving or loading the data
+Either save the data if there are new changes (version should also change) or Load the data
+```{r}
+# save(file = "Prepared datasets/ratios_long.RData", df.ratios_aggregated)
+
+load(file = "Prepared datasets/ratios_long.RData")
+```
+
+### Linking to the analysis data
+```{r}
+df.analysis_t <- left_join(df.analysis, df.ratios_aggregated, by = c("gvkey", "year"))
+
+df.analysis_t <- drop_na(df.analysis_t)
+
+df.analysis <- df.analysis_t
+
+
+```
+
+# Analysis data
+## Winsorizing values
+```{r}
+df.analysis <- df.analysis %>%
+  mutate(year = as.integer(year),
+         AUDIT_FEES = as.numeric(AUDIT_FEES),
+         AUDITOR_RESIGN = as.integer(AUDITOR_RESIGN),
+         ceo_chair = as.integer(ceo_chair),
+         irregularity = as.integer(irregularity),
+         RES_ADVERSE = as.integer(RES_ADVERSE),
+         RES_IMPROVES = as.integer(RES_IMPROVES),
+         new_sh_issued = as.integer(new_sh_issued),
+         manuf_company = as.integer(manuf_company)) 
+
+df.analysis <- df.analysis %>%
+  mutate(across(where(is.numeric), ~ Winsorize(.x, probs = c(0.01, 0.99))))
+```
+
+## Adding additional variables
+```{r}
+df.analysis <- df.analysis %>%
+  mutate(irregularity_bin = ifelse(irregularity == 2, 0, irregularity))
+```
+
+## Running SMOTE algorithm
+```{r}
+df.analysis_filt <- df.analysis %>%
+  filter(irregularity != 2)
+
+
+
+smote_analysis <- SMOTE(df.analysis_filt[, -ncol(df.analysis_filt)], df.analysis_filt$irregularity, K = 5, dup_size = 0)
+
+
+df.analysis_smote <- smote_analysis$data
+
+df.analysis_smote <- df.analysis_smote %>% rename(irregularity_smote = class)
+```
+
+
+
+## Saving the final data
+```{r}
+save(df.analysis_smote, file = "Prepared datasets/analysis_smote.RData")
+save(df.analysis, file = "Prepared datasets/analysis.RData")
+```
+
