@@ -5,4 +5,6 @@ The data is retrieved from WRDS, and direct links to the specific databases can 
 
 In order to run the analysis .rmd files, make sure you download both the rmd and the data file as a whole. If you save both in the same folder, the .rmd should run without any changes.
 
-The original data could not be added to this repository as the size of the files is too large. For this reason, I have added the knitted verison of the data_preparation.rmd file.
+The original data could not be added to this repository as the size of the files is too large. The prepared datasets are added in the zip file.
+
+Additionally, I have added the main analysis in the file analysis_correct.rmd and the feature importance trend analysis in feature_importance_trend.rmd
